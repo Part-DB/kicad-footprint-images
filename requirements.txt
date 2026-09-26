@@ -1,0 +1,4 @@
+cadquery-ocp
+vtk
+numpy
+pillow

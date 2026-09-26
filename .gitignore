@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded models and rendered output
+cache/
+previews/
+previews_*/
+
+# Partial downloads/renders from interrupted runs
+*.part
+*.part.png
