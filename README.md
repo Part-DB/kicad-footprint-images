@@ -23,6 +23,12 @@ Pointing `--repo` at an existing full clone also works (it is left untouched).
 
 Output: `previews/<Library>/<Model>.png`, matching `<Library>.pretty/<Footprint>`.
 Existing PNGs are skipped unless `--force`.
+
+After rendering, size-optimized copies are written to `previews_optimized/` (same layout):
+palette quantization with libimagequant (keeps transparent edges smooth) plus lossless
+oxipng recompression, roughly 40-60% smaller. Only new or changed images are processed.
+Options: `--optimized-out DIR`, `--colors N` (0 = lossless only), `--optimized-size PX`
+(e.g. 128 for thumbnails), `--optimize-only` (skip rendering), `--no-optimize`.
 `--update` fetches the latest `--ref` (default `master`, or a tag like `9.0.0`) into the clone.
 
 Useful options: `--size`, `--background '#ffffff'`, `--azimuth`, `--elevation`,

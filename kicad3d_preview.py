@@ -492,6 +492,85 @@ def render_meshes(meshes: list[Mesh], out_path: Path, opt: RenderOptions) -> Non
 
 
 # ---------------------------------------------------------------------------
+# PNG optimization
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OptimizeOptions:
+    colors: int = 256  # palette size for lossy quantization, 0 = lossless only
+    size: int | None = None  # downscale to this size (square), None = keep
+    level: int = 4  # oxipng effort 0-6
+
+
+def optimize_png(src: Path, dst: Path, opt: OptimizeOptions) -> tuple[int, int]:
+    """Write a smaller copy of `src` to `dst`: optional downscale, palette
+    quantization (libimagequant, keeps smooth alpha edges) and lossless
+    recompression (oxipng). Returns (source size, optimized size) in bytes."""
+    import io
+
+    import imagequant
+    import oxipng
+    from PIL import Image
+
+    img = Image.open(src)
+    img.load()
+    if opt.size and img.size != (opt.size, opt.size):
+        img = img.convert("RGBA").resize((opt.size, opt.size), Image.LANCZOS)
+    if opt.colors:
+        img = imagequant.quantize_pil_image(img.convert("RGBA"), dithering_level=1.0, max_colors=opt.colors)
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    data = oxipng.optimize_from_memory(buf.getvalue(), level=opt.level, strip=oxipng.StripChunks.safe())
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.stem + ".part.png")
+    tmp.write_bytes(data)
+    tmp.replace(dst)
+    return src.stat().st_size, len(data)
+
+
+def _optimize_job(args: tuple) -> tuple[str, str | None, int, int]:
+    src, dst, opt = args
+    try:
+        return src, None, *optimize_png(Path(src), Path(dst), opt)
+    except Exception as e:  # noqa: BLE001 - report and continue with other images
+        return src, f"{e}\n{traceback.format_exc(limit=3)}", 0, 0
+
+
+def optimize_all(src_dir: Path, dst_dir: Path, opt: OptimizeOptions, jobs: int, force: bool) -> int:
+    """Optimize every PNG in `src_dir` into `dst_dir` (same layout) that is missing or outdated."""
+    tasks = []
+    for src in sorted(src_dir.rglob("*.png")):
+        if src.name.endswith(".part.png"):
+            continue
+        dst = dst_dir / src.relative_to(src_dir)
+        if force or not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            tasks.append((str(src), str(dst), opt))
+    if not tasks:
+        print(f"optimized images in {dst_dir} are up to date", file=sys.stderr)
+        return 0
+
+    print(f"Optimizing {len(tasks)} images into {dst_dir} ...", file=sys.stderr)
+    failures = total_in = total_out = 0
+    with multiprocessing.Pool(jobs) as pool:
+        for i, (src, err, n_in, n_out) in enumerate(pool.imap_unordered(_optimize_job, tasks), 1):
+            if err:
+                failures += 1
+                print(f"[{i}/{len(tasks)}] FAILED optimizing {src}: {err}", file=sys.stderr)
+            else:
+                total_in += n_in
+                total_out += n_out
+                print(f"[{i}/{len(tasks)}] {Path(src).name} {n_in // 1024} -> {n_out // 1024} KiB", file=sys.stderr)
+
+    ratio = 100 * total_out / total_in if total_in else 0
+    print(f"optimized: {total_in / 1e6:.1f} MB -> {total_out / 1e6:.1f} MB ({ratio:.0f}%), "
+          f"{failures} failed -> {dst_dir}", file=sys.stderr)
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
 
@@ -548,7 +627,16 @@ def main() -> int:
     ap.add_argument("--no-edges", action="store_true", help="do not draw feature edge outlines")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)),
                     help="parallel render processes")
-    ap.add_argument("--force", action="store_true", help="re-render existing images")
+    ap.add_argument("--optimized-out", type=Path, default=Path("previews_optimized"),
+                    help="directory for size-optimized copies of the previews (default: ./previews_optimized)")
+    ap.add_argument("--no-optimize", action="store_true", help="skip the PNG optimization step")
+    ap.add_argument("--optimize-only", action="store_true",
+                    help="do not render, only optimize the existing images in --out")
+    ap.add_argument("--colors", type=int, default=256,
+                    help="palette colors for the optimized PNGs, 2-256; 0 = lossless only (default: 256)")
+    ap.add_argument("--optimized-size", type=int, default=None,
+                    help="downscale optimized PNGs to this size in pixels (default: same as --size)")
+    ap.add_argument("--force", action="store_true", help="re-render / re-optimize existing images")
     ap.add_argument("--checkout-only", action="store_true", help="only clone/check out models, do not render")
     ap.add_argument("--list", action="store_true", help="list available libraries and exit")
     args = ap.parse_args()
@@ -562,6 +650,11 @@ def main() -> int:
         background=args.background,
         edges=not args.no_edges,
     )
+
+    optimize_opt = OptimizeOptions(colors=max(0, min(256, args.colors)), size=args.optimized_size)
+
+    if args.optimize_only:
+        return 1 if optimize_all(args.out, args.optimized_out, optimize_opt, args.jobs, args.force) else 0
 
     def model_selected(name: str) -> bool:
         return not args.model or any(fnmatch.fnmatch(name, p) for p in args.model)
@@ -609,27 +702,28 @@ def main() -> int:
     if not args.force:
         tasks = [(m, o) for m, o in tasks if not o.exists()]
     tasks.sort()
-    if not tasks:
-        print("nothing to render (use --force to re-render)", file=sys.stderr)
-        return 0
 
     failures = 0
-    print(f"Rendering {len(tasks)} models with {args.jobs} processes ...", file=sys.stderr)
-    # Workers are recycled to bound OCC/VTK memory growth. multiprocessing.Pool is used
-    # instead of ProcessPoolExecutor(max_tasks_per_child=...), which hangs on Python 3.12
-    # once the first generation of workers has exited.
-    jobs = [(str(m), str(o), opt) for m, o in tasks]
-    with multiprocessing.Pool(args.jobs, maxtasksperchild=20) as pool:
-        for i, (model, err, dt) in enumerate(pool.imap_unordered(_render_job_star, jobs), 1):
-            if err:
-                failures += 1
-                print(f"[{i}/{len(tasks)}] FAILED {model}: {err}", file=sys.stderr)
-            else:
-                print(f"[{i}/{len(tasks)}] {Path(model).name} ({dt:.1f}s)", file=sys.stderr)
+    if not tasks:
+        print("nothing to render (use --force to re-render)", file=sys.stderr)
+    else:
+        print(f"Rendering {len(tasks)} models with {args.jobs} processes ...", file=sys.stderr)
+        # Workers are recycled to bound OCC/VTK memory growth. multiprocessing.Pool is used
+        # instead of ProcessPoolExecutor(max_tasks_per_child=...), which hangs on Python 3.12
+        # once the first generation of workers has exited.
+        jobs = [(str(m), str(o), opt) for m, o in tasks]
+        with multiprocessing.Pool(args.jobs, maxtasksperchild=20) as pool:
+            for i, (model, err, dt) in enumerate(pool.imap_unordered(_render_job_star, jobs), 1):
+                if err:
+                    failures += 1
+                    print(f"[{i}/{len(tasks)}] FAILED {model}: {err}", file=sys.stderr)
+                else:
+                    print(f"[{i}/{len(tasks)}] {Path(model).name} ({dt:.1f}s)", file=sys.stderr)
+        print(f"done: {len(tasks) - failures} rendered, {failures} failed -> {args.out}", file=sys.stderr)
 
-    print(f"done: {len(tasks) - failures} rendered, {failures} failed -> {args.out}", file=sys.stderr)
+    if not args.no_optimize and args.out.is_dir():
+        failures += optimize_all(args.out, args.optimized_out, optimize_opt, args.jobs, args.force)
     return 1 if failures else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

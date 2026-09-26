@@ -2,3 +2,5 @@ cadquery-ocp
 vtk
 numpy
 pillow
+imagequant
+pyoxipng
