@@ -34,9 +34,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
 import fnmatch
 import math
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -505,6 +505,10 @@ def _render_job(model_path: str, out_path: str, opt: RenderOptions) -> tuple[str
         return model_path, f"{e}\n{traceback.format_exc(limit=3)}", time.time() - t0
 
 
+def _render_job_star(args: tuple) -> tuple[str, str | None, float]:
+    return _render_job(*args)
+
+
 def parse_color(value: str) -> tuple[float, float, float] | None:
     if value.lower() in ("transparent", "none"):
         return None
@@ -611,10 +615,12 @@ def main() -> int:
 
     failures = 0
     print(f"Rendering {len(tasks)} models with {args.jobs} processes ...", file=sys.stderr)
-    with cf.ProcessPoolExecutor(args.jobs, max_tasks_per_child=20) as pool:
-        futures = [pool.submit(_render_job, str(m), str(o), opt) for m, o in tasks]
-        for i, fut in enumerate(cf.as_completed(futures), 1):
-            model, err, dt = fut.result()
+    # Workers are recycled to bound OCC/VTK memory growth. multiprocessing.Pool is used
+    # instead of ProcessPoolExecutor(max_tasks_per_child=...), which hangs on Python 3.12
+    # once the first generation of workers has exited.
+    jobs = [(str(m), str(o), opt) for m, o in tasks]
+    with multiprocessing.Pool(args.jobs, maxtasksperchild=20) as pool:
+        for i, (model, err, dt) in enumerate(pool.imap_unordered(_render_job_star, jobs), 1):
             if err:
                 failures += 1
                 print(f"[{i}/{len(tasks)}] FAILED {model}: {err}", file=sys.stderr)
