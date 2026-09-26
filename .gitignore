@@ -3,11 +3,10 @@
 __pycache__/
 *.py[cod]
 
-# Downloaded models and rendered output
-cache/
+# Model repository clone and rendered output
+kicad-packages3D/
 previews/
 previews_*/
 
-# Partial downloads/renders from interrupted runs
-*.part
+# Partial renders from interrupted runs
 *.part.png

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Download KiCad 3D models and render them into PNG preview images.
+"""Render KiCad 3D models into PNG preview images.
 
-Models are fetched from the official KiCad 3D model repository
+Models come from a git clone of the official KiCad 3D model repository
 (https://gitlab.com/kicad/libraries/kicad-packages3D, the source behind
-https://kicad.github.io/packages3d/) and rendered offscreen with the colors
-stored in the model files.
+https://kicad.github.io/packages3d/), which is created on first use
+(--repo, default ./kicad-packages3D). The clone is sparse: only the
+selected libraries are downloaded. An existing full clone works as well.
+Models are rendered offscreen with the colors stored in the model files.
 
 Current KiCad versions (10+) ship STEP models only; KiCad <= 9 tags also
 contain the VRML (.wrl) variants. Both formats can be rendered.
@@ -22,7 +24,10 @@ Examples:
     # glob patterns for libraries and models
     ./kicad3d_preview.py -l 'Connector_*' -m '*USB*'
 
-    # render local files or directories (no download)
+    # update the clone to the latest master (or another tag with --ref)
+    ./kicad3d_preview.py --update -l Resistor_SMD
+
+    # render local files or directories (no git repository)
     ./kicad3d_preview.py --input ~/my_models/ --out previews
 """
 
@@ -31,107 +36,85 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import fnmatch
-import json
 import math
 import os
+import subprocess
 import sys
 import time
 import traceback
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-GITLAB_API = "https://gitlab.com/api/v4"
-GITLAB_PROJECT = "kicad/libraries/kicad-packages3D"
-RAW_URL = "https://gitlab.com/kicad/libraries/kicad-packages3D/-/raw/{ref}/{path}"
+REPO_URL = "https://gitlab.com/kicad/libraries/kicad-packages3D.git"
 
 MODEL_EXTS = {"step": (".step", ".stp"), "wrl": (".wrl",)}
 
 # ---------------------------------------------------------------------------
-# Download
+# Model repository (git)
 # ---------------------------------------------------------------------------
 
 
-def _http_get(url: str, retries: int = 6) -> tuple[bytes, dict]:
-    headers = {"User-Agent": "kicad3d-preview"}
-    token = os.environ.get("GITLAB_TOKEN")
-    if token and url.startswith(GITLAB_API):
-        headers["PRIVATE-TOKEN"] = token
-    delay = 2.0
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return resp.read(), dict(resp.headers)
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                wait = float(e.headers.get("Retry-After") or delay)
-                time.sleep(wait)
-                delay *= 2
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError):
-            if attempt < retries - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise
-    raise RuntimeError("unreachable")
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, text=True, stdout=subprocess.PIPE
+    ).stdout
 
 
-def _list_tree(ref: str, path: str = "") -> list[dict]:
-    project = urllib.parse.quote(GITLAB_PROJECT, safe="")
-    items: list[dict] = []
-    page = 1
-    while True:
-        query = {"ref": ref, "per_page": 100, "page": page}
-        if path:
-            query["path"] = path
-        url = f"{GITLAB_API}/projects/{project}/repository/tree?" + urllib.parse.urlencode(query)
-        data, headers = _http_get(url)
-        batch = json.loads(data)
-        items.extend(batch)
-        next_page = headers.get("X-Next-Page") or headers.get("x-next-page")
-        if not batch or not next_page:
-            break
-        page = int(next_page)
-    return items
+def ensure_repo(repo: Path, ref: str, update: bool) -> None:
+    """Clone the model repository, or fetch `ref` into an existing clone if `update` is set.
+
+    The clone is shallow, blobless and sparse: only the tree listing is fetched
+    up front, model files are downloaded when their library is checked out.
+    """
+    if not (repo / ".git").exists():
+        print(f"Cloning {REPO_URL} ({ref}) into {repo} ...", file=sys.stderr)
+        repo.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+             "--branch", ref, REPO_URL, str(repo)],
+            check=True,
+        )
+    elif update:
+        print(f"Updating {repo} to {ref} ...", file=sys.stderr)
+        subprocess.run(["git", "-C", str(repo), "fetch", "--depth", "1", "--filter=blob:none", "origin", ref],
+                       check=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", "--detach", "FETCH_HEAD"], check=True)
 
 
-def list_libraries(ref: str) -> list[str]:
-    """Return library names (without the .3dshapes suffix)."""
-    return sorted(
-        item["name"][: -len(".3dshapes")]
-        for item in _list_tree(ref)
-        if item["type"] == "tree" and item["name"].endswith(".3dshapes")
-    )
+def is_sparse(repo: Path) -> bool:
+    try:
+        return _git(repo, "config", "--bool", "core.sparseCheckout").strip() == "true"
+    except subprocess.CalledProcessError:
+        return False
 
 
-def list_models(ref: str, lib: str, fmt: str) -> list[str]:
+def list_libraries(repo: Path) -> list[str]:
+    """Return library names (without the .3dshapes suffix) from the checked out commit."""
+    names = _git(repo, "ls-tree", "-d", "--name-only", "HEAD").splitlines()
+    return sorted(n.removesuffix(".3dshapes") for n in names if n.endswith(".3dshapes"))
+
+
+def list_models(repo: Path, lib: str, fmt: str) -> list[str]:
     """Return repository paths of all models of the given format in a library."""
     exts = MODEL_EXTS[fmt]
-    return sorted(
-        item["path"]
-        for item in _list_tree(ref, f"{lib}.3dshapes")
-        if item["type"] == "blob" and item["name"].lower().endswith(exts)
-    )
+    paths = _git(repo, "ls-tree", "--name-only", "HEAD", f"{lib}.3dshapes/").splitlines()
+    return sorted(p for p in paths if p.lower().endswith(exts))
 
 
-def download_model(ref: str, repo_path: str, cache_dir: Path) -> Path:
-    dest = cache_dir / ref / repo_path
-    if dest.exists() and dest.stat().st_size > 0:
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    url = RAW_URL.format(ref=urllib.parse.quote(ref, safe=""), path=urllib.parse.quote(repo_path))
-    data, _ = _http_get(url)
-    tmp = dest.with_name(dest.name + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(dest)
-    return dest
+def checkout_libraries(repo: Path, libs: list[str], all_libs: bool) -> None:
+    """Make sure the given libraries are present in the working tree (sparse clones only)."""
+    if not is_sparse(repo):
+        return  # full checkout, everything is already there
+    if all_libs:
+        print("Checking out all libraries (this downloads several GB) ...", file=sys.stderr)
+        subprocess.run(["git", "-C", str(repo), "sparse-checkout", "disable"], check=True)
+        return
+    missing = [f"{l}.3dshapes" for l in libs if not (repo / f"{l}.3dshapes").is_dir()]
+    if missing:
+        print(f"Checking out {len(missing)} libraries ...", file=sys.stderr)
+        subprocess.run(["git", "-C", str(repo), "sparse-checkout", "add", *missing], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -541,12 +524,15 @@ def main() -> int:
                     help="library name or glob, e.g. 'Resistor_SMD' or 'Package_*' (repeatable; default: all)")
     ap.add_argument("-m", "--model", action="append", default=[],
                     help="model name glob, e.g. '*QFN-32*' (repeatable; default: all)")
-    ap.add_argument("--ref", default="master", help="git branch/tag of kicad-packages3D (default: master)")
+    ap.add_argument("--repo", type=Path, default=Path("kicad-packages3D"),
+                    help="clone of kicad-packages3D, created if missing (default: ./kicad-packages3D)")
+    ap.add_argument("--ref", default="master",
+                    help="branch/tag to clone, or to fetch with --update (default: master)")
+    ap.add_argument("--update", action="store_true", help="fetch --ref into an existing clone and check it out")
     ap.add_argument("--format", choices=sorted(MODEL_EXTS), default="step",
-                    help="model format to download (default: step; wrl only exists up to tag 9.0.x)")
+                    help="model format to render (default: step; wrl only exists up to tag 9.0.x)")
     ap.add_argument("--input", type=Path, action="append", default=[],
-                    help="render local model files/directories instead of downloading (repeatable)")
-    ap.add_argument("--cache", type=Path, default=Path("cache"), help="download directory (default: ./cache)")
+                    help="render local model files/directories instead of using the repository (repeatable)")
     ap.add_argument("--out", type=Path, default=Path("previews"), help="output directory (default: ./previews)")
     ap.add_argument("--size", type=int, default=512, help="image size in pixels (square, default: 512)")
     ap.add_argument("--supersample", type=int, default=3, help="anti-aliasing factor (default: 3)")
@@ -558,9 +544,8 @@ def main() -> int:
     ap.add_argument("--no-edges", action="store_true", help="do not draw feature edge outlines")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)),
                     help="parallel render processes")
-    ap.add_argument("--download-jobs", type=int, default=8, help="parallel downloads (default: 8)")
     ap.add_argument("--force", action="store_true", help="re-render existing images")
-    ap.add_argument("--download-only", action="store_true", help="only download, do not render")
+    ap.add_argument("--checkout-only", action="store_true", help="only clone/check out models, do not render")
     ap.add_argument("--list", action="store_true", help="list available libraries and exit")
     args = ap.parse_args()
 
@@ -590,7 +575,8 @@ def main() -> int:
                 lib = f.parent.name.removesuffix(".3dshapes")
                 tasks.append((f, args.out / lib / f"{f.stem}.png"))
     else:
-        libs = list_libraries(args.ref)
+        ensure_repo(args.repo, args.ref, args.update)
+        libs = list_libraries(args.repo)
         if args.list:
             print("\n".join(libs))
             return 0
@@ -600,38 +586,21 @@ def main() -> int:
                 print("no library matches the given --lib patterns (see --list)", file=sys.stderr)
                 return 1
 
-        print(f"Listing {len(libs)} libraries at ref '{args.ref}' ...", file=sys.stderr)
-        repo_paths: list[str] = []
-        with cf.ThreadPoolExecutor(args.download_jobs) as pool:
-            for paths in pool.map(lambda l: list_models(args.ref, l, args.format), libs):
-                repo_paths += [p for p in paths if model_selected(Path(p).stem)]
+        repo_paths = [p for l in libs for p in list_models(args.repo, l, args.format)
+                      if model_selected(Path(p).stem)]
         if not repo_paths:
             print(f"no {args.format} models found (note: wrl models only exist up to tag 9.0.x)", file=sys.stderr)
             return 1
 
-        pending = []
+        needed_libs = sorted({Path(p).parent.name.removesuffix(".3dshapes") for p in repo_paths})
+        checkout_libraries(args.repo, needed_libs, all_libs=not args.lib and not args.model)
+        if args.checkout_only:
+            return 0
+
         for rp in repo_paths:
             lib = Path(rp).parent.name.removesuffix(".3dshapes")
-            out = args.out / lib / f"{Path(rp).stem}.png"
-            if args.download_only or args.force or not out.exists():
-                pending.append((rp, out))
-        print(f"{len(repo_paths)} models selected, {len(pending)} to process", file=sys.stderr)
-
-        failed_dl = 0
-        with cf.ThreadPoolExecutor(args.download_jobs) as pool:
-            futures = {pool.submit(download_model, args.ref, rp, args.cache): (rp, out) for rp, out in pending}
-            for i, fut in enumerate(cf.as_completed(futures), 1):
-                rp, out = futures[fut]
-                try:
-                    tasks.append((fut.result(), out))
-                    print(f"[{i}/{len(pending)}] downloaded {rp}", file=sys.stderr)
-                except Exception as e:  # noqa: BLE001
-                    failed_dl += 1
-                    print(f"[{i}/{len(pending)}] FAILED download {rp}: {e}", file=sys.stderr)
-        if failed_dl:
-            print(f"{failed_dl} downloads failed", file=sys.stderr)
-        if args.download_only:
-            return 1 if failed_dl else 0
+            tasks.append((args.repo / rp, args.out / lib / f"{Path(rp).stem}.png"))
+        print(f"{len(repo_paths)} models selected", file=sys.stderr)
 
     if not args.force:
         tasks = [(m, o) for m, o in tasks if not o.exists()]
