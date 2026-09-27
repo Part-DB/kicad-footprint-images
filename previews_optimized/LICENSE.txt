@@ -1,0 +1,5 @@
+# License
+
+These images are licensed under [CC-BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/legalcode).
+
+They are built from [kicad-packages3D](https://gitlab.com/kicad/libraries/kicad-packages3D). See [KiCad's LICENSE.md](https://gitlab.com/kicad/libraries/kicad-packages3D/-/blob/master/LICENSE.md) for more information.
