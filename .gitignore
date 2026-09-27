@@ -5,8 +5,6 @@ __pycache__/
 
 # Model repository clone and rendered output
 kicad-packages3D/
-previews/
-previews_*/
 
 # Partial renders from interrupted runs
 *.part.png
