@@ -1,4 +1,12 @@
-# KiCad 3D model previews
+# KiCad 3D model images
+
+This repository contains images generated from the KiCad 3D models for use in [Part-DB](https://github.com/Part-DB/Part-DB-server), plus the generation script.
+
+* `previews/` contain the generated images
+* `preview_optimized/` contains size optimized version of this images
+
+
+## Script
 
 `kicad3d_preview.py` renders PNG previews (transparent background, isometric view,
 model colors) of the models in the official
@@ -8,11 +16,11 @@ On first run it clones the repository into `./kicad-packages3D` (change with `--
 The clone is shallow and sparse: only the libraries you select get downloaded.
 Pointing `--repo` at an existing full clone also works (it is left untouched).
 
-## Setup
+### Setup
 
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-## Usage
+### Usage
 
     .venv/bin/python kicad3d_preview.py --list                      # list libraries
     .venv/bin/python kicad3d_preview.py -l Resistor_SMD             # one library
@@ -39,3 +47,11 @@ Notes:
   but VTK's VRML importer ignores shared (`USE`) materials, so colors can be wrong; prefer STEP.
 - Headless machines without a display: set `VTK_DEFAULT_OPENGL_WINDOW=vtkEGLRenderWindow`
   (or `vtkOSMesaRenderWindow`).
+
+
+## License
+
+The script is licensed under the MIT License, see kicad3d_preview.py.
+
+The 3D models from KiCad used are licensed under CC-BY-SA 4.0. See [KiCad's LICENSE.md](https://gitlab.com/kicad/libraries/kicad-packages3D/-/blob/master/LICENSE.md).
+The images shipped under in this repository are licensed under the same license: [CC-BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/legalcode)
