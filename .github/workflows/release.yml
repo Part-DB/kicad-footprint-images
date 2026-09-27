@@ -1,0 +1,26 @@
+name: Release assets
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  upload-previews:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build KiCad.zip
+        run: |
+          mkdir -p build/KiCad
+          cp -r previews_optimized/. build/KiCad/
+          cd build
+          zip -r -9 ../KiCad.zip KiCad
+
+      - name: Attach KiCad.zip to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" KiCad.zip --clobber --repo "${{ github.repository }}"
